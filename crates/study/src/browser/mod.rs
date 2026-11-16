@@ -428,20 +428,36 @@ impl Drop for Browser {
     }
 }
 
-/// Chrome records its owner as a `SingletonLock` symlink (`hostname-pid`). If that process is
-/// gone, the lock is stale and the next launch would abort; remove it.
+/// Chrome records its owner as a `SingletonLock` symlink (`hostname-pid`). On Unix, if that
+/// process is gone the lock is stale and the next launch would abort; remove it. Windows has no
+/// portable liveness check here, so the private-profile fallback handles a held profile instead.
 fn clear_stale_lock(profile: &Path) {
-    let lock = profile.join("SingletonLock");
-    let Ok(target) = std::fs::read_link(&lock) else { return };
-    let pid = target.to_string_lossy().rsplit('-').next().and_then(|p| p.parse::<u32>().ok());
-    #[cfg(unix)]
-    if pid.is_some_and(|p| Path::new(&format!("/proc/{p}")).exists()) {
-        return;
+    #[cfg(not(unix))]
+    {
+        let _ = profile;
     }
-    let _ = pid;
-    let _ = std::fs::remove_file(&lock);
-    let _ = std::fs::remove_file(profile.join("SingletonSocket"));
-    let _ = std::fs::remove_file(profile.join("SingletonCookie"));
+    #[cfg(unix)]
+    {
+        let lock = profile.join("SingletonLock");
+        let Ok(target) = std::fs::read_link(&lock) else { return };
+        let pid = target.to_string_lossy().rsplit('-').next().and_then(|p| p.parse::<u32>().ok());
+        // `kill -0` tests liveness without a signal on Linux and macOS alike.
+        let alive = pid.is_some_and(|p| {
+            std::process::Command::new("kill")
+                .arg("-0")
+                .arg(p.to_string())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+        if alive {
+            return;
+        }
+        let _ = std::fs::remove_file(&lock);
+        let _ = std::fs::remove_file(profile.join("SingletonSocket"));
+        let _ = std::fs::remove_file(profile.join("SingletonCookie"));
+    }
 }
 
 impl Browser {
